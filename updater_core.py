@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import os
-import re
 import time
-import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -45,7 +45,6 @@ def _save_state(data: dict[str, Any]) -> None:
 
 
 def _webui_root() -> Path:
-    # When running under WebUI, this is normally the executable working tree.
     try:
         from modules.paths_internal import script_path
         return Path(script_path)
@@ -79,7 +78,6 @@ def find_tagcomplete_dir(configured: str | None = None) -> Path | None:
     if not candidates:
         return None
 
-    # Prefer the canonical upstream directory name.
     candidates.sort(key=lambda p: (p.name.lower() != "a1111-sd-webui-tagcomplete", p.name.lower()))
     return candidates[0].resolve()
 
@@ -87,7 +85,7 @@ def find_tagcomplete_dir(configured: str | None = None) -> Path | None:
 def _get_url(url: str, timeout: int = 20) -> bytes:
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "a1111-danbooru-tagdb-updater/1.0"},
+        headers={"User-Agent": "a1111-danbooru-tagdb-updater/1.1"},
     )
     with urllib.request.urlopen(request, timeout=timeout) as response:
         return response.read()
@@ -96,24 +94,66 @@ def _get_url(url: str, timeout: int = 20) -> bytes:
 def _looks_like_csv(name: str, content: bytes) -> bool:
     if len(content) < MIN_CSV_BYTES:
         return False
-    # Avoid writing an HTML error page or GitHub error body as a CSV.
     text = content[:2000].decode("utf-8", errors="ignore")
     if "<html" in text.lower() or "<!doctype" in text.lower():
         return False
-    lines = [line for line in text.splitlines() if line.strip()]
-    if len(lines) < 5:
+    try:
+        rows = list(csv.reader(io.StringIO(text)))
+    except csv.Error:
         return False
-    if name == "danbooru-jp.csv":
-        return any("," in line for line in lines[:5])
-    return any("," in line for line in lines[:5])
+    rows = [row for row in rows if row]
+    return len(rows) >= 5 and any(len(row) >= 2 for row in rows[:5])
 
 
-def fetch_meta() -> dict[str, Any]:
-    raw = _get_url(f"{SOURCE_BASE}/meta.json")
-    data = json.loads(raw.decode("utf-8"))
-    if not isinstance(data, dict):
-        raise ValueError("meta.json is not an object")
-    return data
+def _normalize_tag_name(value: str) -> str:
+    """Convert the tagdb-updater display form back to Danbooru/tagcomplete form.
+
+    PYU224/tagdb-updater intentionally writes tags as spaces in its CSV output.
+    a1111-sd-webui-tagcomplete expects the canonical underscore form in the CSV,
+    so `bandage on hair` must become `bandage_on_hair` here.
+    """
+    return "_".join(value.strip().split())
+
+
+def _normalize_aliases(value: str) -> str:
+    if not value.strip():
+        return ""
+    aliases = []
+    for alias in value.split(","):
+        alias = _normalize_tag_name(alias)
+        if alias:
+            aliases.append(alias)
+    return ",".join(aliases)
+
+
+def normalize_csv_for_tagcomplete(name: str, content: bytes) -> bytes:
+    """Normalize English tag keys while preserving CSV semantics and UTF-8."""
+    text = content.decode("utf-8-sig")
+    reader = csv.reader(io.StringIO(text))
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\n")
+
+    for row in reader:
+        if not row:
+            continue
+        if name == "danbooru-jp.csv":
+            if len(row) >= 2:
+                row[0] = _normalize_tag_name(row[0])
+                writer.writerow(row[:2])
+            continue
+
+        # danbooru.csv = tag,type,count,aliases
+        # danbooru-ja.csv = tag,type,count,aliases,japanese
+        if len(row) >= 1:
+            row[0] = _normalize_tag_name(row[0])
+        if len(row) >= 4:
+            row[3] = _normalize_aliases(row[3])
+        writer.writerow(row)
+
+    normalized = output.getvalue().encode("utf-8")
+    if len(normalized) < MIN_CSV_BYTES:
+        raise ValueError(f"{name} の正規化結果が不自然に小さくなりました。")
+    return normalized
 
 
 def _meta_fingerprint(meta: dict[str, Any]) -> str:
@@ -140,10 +180,54 @@ def should_check(state: dict[str, Any], interval_days: int) -> bool:
     return (time.time() - last_check) >= interval
 
 
+def _configure_tagcomplete_settings() -> str | None:
+    """Enable Japanese translation search without overwriting an existing choice."""
+    try:
+        from modules import shared
+    except Exception:
+        return None
+
+    try:
+        opts = shared.opts
+        changed = False
+
+        # Main tag file: only set it when currently unset/None.
+        current_tag_file = opts.data.get("tac_tagFile")
+        if not current_tag_file or current_tag_file == "None":
+            opts.data["tac_tagFile"] = "danbooru.csv"
+            changed = True
+
+        current_translation = opts.data.get("tac_translation.translationFile")
+        selected_our_translation = not current_translation or current_translation == "None"
+        if selected_our_translation:
+            opts.data["tac_translation.translationFile"] = "danbooru-jp.csv"
+            changed = True
+
+            # Only enable translation search automatically when this extension is the
+            # one selecting the Japanese translation file. A user's custom translation
+            # file and explicit search setting are otherwise left untouched.
+            if opts.data.get("tac_translation.searchByTranslation") is not True:
+                opts.data["tac_translation.searchByTranslation"] = True
+                changed = True
+        elif current_translation == "danbooru-jp.csv" and opts.data.get("tac_translation.searchByTranslation") is not True:
+            # The user already selected our file, so enabling its search is a safe repair.
+            opts.data["tac_translation.searchByTranslation"] = True
+            changed = True
+
+        if changed:
+            opts.save(shared.config_filename)
+            return "Tag Autocomplete の日本語検索設定も自動設定しました。"
+        return None
+    except Exception as exc:
+        # Do not make DB update fail just because a Forge/WebUI fork changed option internals.
+        return f"日本語検索の自動設定はスキップしました（{exc}）。"
+
+
 def update_tagdb(
     configured_dir: str | None = None,
     force: bool = False,
     interval_days: int = DEFAULT_INTERVAL_DAYS,
+    auto_configure: bool = True,
 ) -> UpdateResult:
     state = _load_state()
     target = find_tagcomplete_dir(configured_dir)
@@ -175,14 +259,14 @@ def update_tagdb(
             "source_fingerprint": fingerprint,
         })
 
-        # Same source snapshot: no need to re-download unless forced and files are missing.
         tag_dir = target / "tags"
         missing = [name for name in FILES if not (tag_dir / name).is_file()]
         if not force and previous == fingerprint and not missing:
+            setting_note = _configure_tagcomplete_settings() if auto_configure else None
             _save_state(state)
             return UpdateResult(
                 status="up_to_date",
-                message=f"最新DBです（{fingerprint}）。",
+                message="最新DBです（" + fingerprint + "）。" + ("\n" + setting_note if setting_note else ""),
                 checked_at=now,
                 source_fingerprint=fingerprint,
                 tagcomplete_dir=str(target),
@@ -191,13 +275,11 @@ def update_tagdb(
         tag_dir.mkdir(parents=True, exist_ok=True)
         downloaded: dict[str, bytes] = {}
         for name in FILES:
-            content = _get_url(f"{SOURCE_BASE}/{name}")
-            if not _looks_like_csv(name, content):
+            raw = _get_url(f"{SOURCE_BASE}/{name}")
+            if not _looks_like_csv(name, raw):
                 raise ValueError(f"{name} の内容をCSVとして検証できませんでした。")
-            downloaded[name] = content
+            downloaded[name] = normalize_csv_for_tagcomplete(name, raw)
 
-        # Prepare every temporary file first. Then swap them in, keeping a backup
-        # so a partial disk failure can be rolled back without losing the old DB.
         temp_files: dict[str, Path] = {}
         for name, content in downloaded.items():
             destination = tag_dir / name
@@ -253,9 +335,15 @@ def update_tagdb(
         })
         _save_state(state)
 
+        setting_note = _configure_tagcomplete_settings() if auto_configure else None
+        suffix = "\n" + setting_note if setting_note else ""
         return UpdateResult(
             status="updated",
-            message=f"DanbooruタグDBを更新しました（{fingerprint}）。WebUIの再起動を推奨します。",
+            message=(
+                f"DanbooruタグDBを更新しました（{fingerprint}）。\n"
+                "Tag Autocompleteが新しいDBを確実に読み込むため、Forge Neoの再起動を推奨します。"
+                f"{suffix}"
+            ),
             changed=True,
             checked_at=now,
             source_fingerprint=fingerprint,
@@ -277,6 +365,14 @@ def update_tagdb(
             source_fingerprint=str(state.get("source_fingerprint") or "") or None,
             tagcomplete_dir=str(target),
         )
+
+
+def fetch_meta() -> dict[str, Any]:
+    raw = _get_url(f"{SOURCE_BASE}/meta.json")
+    data = json.loads(raw.decode("utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError("meta.json is not an object")
+    return data
 
 
 def status_snapshot(configured_dir: str | None = None) -> dict[str, Any]:

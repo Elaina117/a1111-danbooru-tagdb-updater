@@ -22,10 +22,10 @@ try:
             configured_dir=config.get("tagcomplete_dir") or None,
             force=False,
             interval_days=int(config.get("interval_days", 7)),
+            auto_configure=bool(config.get("auto_configure_tagcomplete", True)),
         )
         print(f"[Danbooru Tag DB Updater] {result.message}")
     else:
         print("[Danbooru Tag DB Updater] 自動更新は設定でOFFになっています。")
 except Exception as exc:
-    # Never prevent Forge Neo from starting because the updater failed.
     print(f"[Danbooru Tag DB Updater] startup update failed: {exc}")

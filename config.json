@@ -1,5 +1,6 @@
 {
   "auto_update": true,
   "interval_days": 7,
-  "tagcomplete_dir": ""
+  "tagcomplete_dir": "",
+  "auto_configure_tagcomplete": true
 }
